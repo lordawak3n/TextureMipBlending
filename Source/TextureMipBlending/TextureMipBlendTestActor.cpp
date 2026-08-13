@@ -1,13 +1,17 @@
 #include "TextureMipBlendTestActor.h"
 
+#include "Components/InputComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/CollisionProfile.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Engine/Texture.h"
+#include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialInterface.h"
 #include "TextureResource.h"
 #include "RenderingThread.h"
+#include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogTextureMipBlend, Log, All);
@@ -35,20 +39,20 @@ ATextureMipBlendTestActor::ATextureMipBlendTestActor()
 	TileMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	TileMesh->SetCollisionProfileName(UCollisionProfile::BlockAll_ProfileName);
 	TileMesh->SetMobility(EComponentMobility::Movable);
+
+	AutoReceiveInput = EAutoReceiveInput::Player0;
 }
 
 void ATextureMipBlendTestActor::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
 
-	// Editor-only preview (BP editor / placed actor viewport). PIE/game always re-inits in BeginPlay.
+	ApplyTileTransform();
+
+	// Super runs Blueprint Construction Script first — bind after so the mesh keeps our MID.
 	if (GetWorld() && !GetWorld()->IsGameWorld())
 	{
-		InitializeTileVisuals(/*bForceTextureRebuild=*/false);
-	}
-	else
-	{
-		ApplyTileTransform();
+		InitializeTileVisuals(/*bForceTextureRebuild=*/true);
 	}
 }
 
@@ -56,19 +60,123 @@ void ATextureMipBlendTestActor::BeginPlay()
 {
 	Super::BeginPlay();
 
+	bBoundToHiRes = false;
+	bSwapScheduled = false;
+	bPendingBindHiRes = false;
+	CurrentRefineBias = 0.0f;
+
 	// PIE duplicates can retain editor-world texture pointers or a MID that still samples the material default.
 	InitializeTileVisuals(/*bForceTextureRebuild=*/true);
+	SetupSwapInput();
 
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("%s Phase 1 ready: bound %dx%d lo-res (%d mips) on MID '%s'. Hi-res %dx%d generated but not bound. TileTexture param = '%s'."),
+		TEXT("%s Phase 2 ready: %dx%d lo-res bound (RefineBias=0). Press '%s' to toggle hi-res after %.2fs delay. Expect green->red pop on upgrade."),
 		*GetName(),
 		LoResTexture ? LoResTexture->GetSizeX() : 0,
 		LoResTexture ? LoResTexture->GetSizeY() : 0,
-		LoResTexture ? LoResTexture->GetNumMips() : 0,
-		TileMid ? *TileMid->GetName() : TEXT("null"),
-		HiResTexture ? HiResTexture->GetSizeX() : 0,
-		HiResTexture ? HiResTexture->GetSizeY() : 0,
-		*TextureMipBlend::TextureParamName.ToString());
+		*SwapKey.GetDisplayName().ToString(),
+		SwapDelaySeconds);
+}
+
+void ATextureMipBlendTestActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (GetWorld())
+	{
+		GetWorldTimerManager().ClearTimer(SwapDelayTimerHandle);
+	}
+
+	bSwapScheduled = false;
+	Super::EndPlay(EndPlayReason);
+}
+
+void ATextureMipBlendTestActor::SetupSwapInput()
+{
+	APlayerController* PlayerController = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	if (PlayerController)
+	{
+		EnableInput(PlayerController);
+	}
+
+	if (!InputComponent)
+	{
+		UE_LOG(LogTextureMipBlend, Warning, TEXT("%s has no InputComponent; swap key will not work."), *GetName());
+		return;
+	}
+
+	InputComponent->BindKey(SwapKey, IE_Pressed, this, &ATextureMipBlendTestActor::HandleSwapKeyPressed);
+}
+
+void ATextureMipBlendTestActor::HandleSwapKeyPressed()
+{
+	if (!GetWorld() || !LoResTexture || !HiResTexture)
+	{
+		return;
+	}
+
+	if (bSwapScheduled)
+	{
+		UE_LOG(LogTextureMipBlend, Warning,
+			TEXT("%s: swap already scheduled (waiting %.2fs). Ignoring duplicate key press."),
+			*GetName(),
+			GetWorldTimerManager().GetTimerRemaining(SwapDelayTimerHandle));
+		return;
+	}
+
+	bPendingBindHiRes = !bBoundToHiRes;
+
+	if (SwapDelaySeconds <= 0.0f)
+	{
+		ApplyPendingTextureSwap();
+		return;
+	}
+
+	bSwapScheduled = true;
+	const FString TargetLabel = bPendingBindHiRes
+		? FString::Printf(TEXT("HiRes %dx%d (close pixels should go Red)"), HiResTexture->GetSizeX(), HiResTexture->GetSizeY())
+		: FString::Printf(TEXT("LoRes %dx%d (close pixels should go Green)"), LoResTexture->GetSizeX(), LoResTexture->GetSizeY());
+
+	UE_LOG(LogTextureMipBlend, Display,
+		TEXT("%s: '%s' pressed — swapping to %s in %.2fs (RefineBias stays 0)."),
+		*GetName(),
+		*SwapKey.GetDisplayName().ToString(),
+		*TargetLabel,
+		SwapDelaySeconds);
+
+	GetWorldTimerManager().SetTimer(
+		SwapDelayTimerHandle,
+		this,
+		&ATextureMipBlendTestActor::ApplyPendingTextureSwap,
+		SwapDelaySeconds,
+		false);
+}
+
+void ATextureMipBlendTestActor::ApplyPendingTextureSwap()
+{
+	bSwapScheduled = false;
+	GetWorldTimerManager().ClearTimer(SwapDelayTimerHandle);
+
+	UTexture2D* TextureToBind = bPendingBindHiRes ? HiResTexture.Get() : LoResTexture.Get();
+	if (!TextureToBind)
+	{
+		UE_LOG(LogTextureMipBlend, Error, TEXT("%s: pending texture swap failed — target texture is null."), *GetName());
+		return;
+	}
+
+	const bool bWasLoRes = !bBoundToHiRes;
+	BindTextureToMaterial(TextureToBind, bPendingBindHiRes, /*bForceRecreateMid=*/false);
+
+	if (bWasLoRes && bBoundToHiRes)
+	{
+		UE_LOG(LogTextureMipBlend, Display,
+			TEXT("%s: NAIVE hi-res bind complete — close pixels should snap Green -> Red (resolution pop)."),
+			*GetName());
+	}
+	else if (!bWasLoRes && !bBoundToHiRes)
+	{
+		UE_LOG(LogTextureMipBlend, Display,
+			TEXT("%s: reverted to lo-res — close pixels should snap Red -> Green."),
+			*GetName());
+	}
 }
 
 #if WITH_EDITOR
@@ -97,7 +205,11 @@ void ATextureMipBlendTestActor::InitializeTileVisuals(bool bForceTextureRebuild)
 {
 	ApplyTileTransform();
 	EnsureGeneratedTextures(bForceTextureRebuild);
-	BindLoResToMaterial(bForceTextureRebuild);
+
+	if (LoResTexture)
+	{
+		BindTextureToMaterial(LoResTexture, /*bIsHiResBinding=*/false, /*bForceRecreateMid=*/true);
+	}
 }
 
 void ATextureMipBlendTestActor::ApplyTileTransform()
@@ -342,11 +454,7 @@ void ATextureMipBlendTestActor::EnsureGeneratedTextures(bool bForceRebuild)
 
 	HiResTexture->UpdateResource();
 	LoResTexture->UpdateResource();
-
-	if (GetWorld() && GetWorld()->IsGameWorld())
-	{
-		FlushRenderingCommands();
-	}
+	FlushRenderingCommands();
 
 	RefreshMipColorDebugInfo();
 
@@ -360,9 +468,53 @@ void ATextureMipBlendTestActor::EnsureGeneratedTextures(bool bForceRebuild)
 		*GetMipDebugColor(0).ToString());
 }
 
-void ATextureMipBlendTestActor::BindLoResToMaterial(bool bForceRecreateMid)
+void ATextureMipBlendTestActor::EnsureTextureResourceReady(UTexture2D* Texture)
 {
-	if (!TileMesh)
+	if (!Texture)
+	{
+		return;
+	}
+
+	if (!Texture->GetResource())
+	{
+		Texture->UpdateResource();
+		FlushRenderingCommands();
+	}
+}
+
+void ATextureMipBlendTestActor::LogMaterialTextureParameterNames() const
+{
+	if (!TileMaterial)
+	{
+		return;
+	}
+
+	TArray<FMaterialParameterInfo> ParameterInfos;
+	TArray<FGuid> ParameterIds;
+	TileMaterial->GetAllTextureParameterInfo(ParameterInfos, ParameterIds);
+
+	if (ParameterInfos.IsEmpty())
+	{
+		UE_LOG(LogTextureMipBlend, Error,
+			TEXT("%s: material '%s' exposes no texture parameters. TileTexture must be a Texture Sample converted to a parameter."),
+			*GetName(),
+			*TileMaterial->GetName());
+		return;
+	}
+
+	for (const FMaterialParameterInfo& Info : ParameterInfos)
+	{
+		UE_LOG(LogTextureMipBlend, Display,
+			TEXT("%s: material '%s' texture parameter '%s'"),
+			*GetName(),
+			*TileMaterial->GetName(),
+			*Info.Name.ToString());
+	}
+}
+
+void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid)
+{
+	if (!TileMesh || !Texture)
 	{
 		return;
 	}
@@ -375,13 +527,23 @@ void ATextureMipBlendTestActor::BindLoResToMaterial(bool bForceRecreateMid)
 		return;
 	}
 
-	if (!LoResTexture || !LoResTexture->GetResource())
+	EnsureTextureResourceReady(Texture);
+
+	if (!Texture->GetResource())
 	{
-		UE_LOG(LogTextureMipBlend, Warning, TEXT("%s has no valid lo-res texture resource to bind."), *GetName());
+		UE_LOG(LogTextureMipBlend, Error,
+			TEXT("%s: texture '%s' still has no GPU resource after UpdateResource."),
+			*GetName(),
+			*Texture->GetName());
 		return;
 	}
 
-	if (bForceRecreateMid || !TileMid || TileMid->Parent != TileMaterial)
+	if (bForceRecreateMid)
+	{
+		TileMid = nullptr;
+	}
+
+	if (!TileMid)
 	{
 		TileMid = UMaterialInstanceDynamic::Create(TileMaterial, this, NAME_None);
 		if (!TileMid)
@@ -389,27 +551,53 @@ void ATextureMipBlendTestActor::BindLoResToMaterial(bool bForceRecreateMid)
 			UE_LOG(LogTextureMipBlend, Error, TEXT("%s failed to create a dynamic material instance."), *GetName());
 			return;
 		}
-
-		TileMesh->SetMaterial(0, TileMid);
 	}
 
-	TileMid->SetTextureParameterValue(TextureMipBlend::TextureParamName, LoResTexture);
-	TileMid->SetScalarParameterValue(TextureMipBlend::RefineBiasParamName, 0.0f);
+	// Phase 2: naive swap — no mip bias fade.
+	const float RefineBias = 0.0f;
 
-	if (TileMid->K2_GetTextureParameterValue(TextureMipBlend::TextureParamName) != LoResTexture)
+	const FMaterialParameterInfo TextureParamInfo(TextureMipBlend::TextureParamName);
+	const FMaterialParameterInfo BiasParamInfo(TextureMipBlend::RefineBiasParamName);
+
+	TileMid->SetTextureParameterValueByInfo(TextureParamInfo, Texture);
+	TileMid->SetScalarParameterValueByInfo(BiasParamInfo, RefineBias);
+
+	// Apply MID to mesh after parameters are set (order matters for some render paths).
+	TileMesh->SetMaterial(0, TileMid);
+
+	UTexture* BoundTexture = TileMid->K2_GetTextureParameterValue(TextureMipBlend::TextureParamName);
+	if (BoundTexture != Texture)
 	{
+		LogMaterialTextureParameterNames();
 		UE_LOG(LogTextureMipBlend, Error,
-			TEXT("%s: MID '%s' did not retain texture parameter '%s'. Check M_TileMipBlend parameter name matches exactly."),
+			TEXT("%s: MID '%s' TileTexture is '%s', expected '%s'. Parameter name must be exactly '%s'."),
 			*GetName(),
 			*TileMid->GetName(),
+			BoundTexture ? *BoundTexture->GetName() : TEXT("null"),
+			*Texture->GetName(),
 			*TextureMipBlend::TextureParamName.ToString());
 	}
+	else
+	{
+		UE_LOG(LogTextureMipBlend, Display,
+			TEXT("%s: bound '%s' on MID '%s' (mesh slot 0, RefineBias=%.2f)."),
+			*GetName(),
+			*Texture->GetName(),
+			*TileMid->GetName(),
+			RefineBias);
+	}
 
+	bBoundToHiRes = bIsHiResBinding;
+	CurrentRefineBias = RefineBias;
+
+	const TCHAR* ResLabel = bIsHiResBinding ? TEXT("HiRes") : TEXT("LoRes");
 	BoundTextureDescription = FString::Printf(
-		TEXT("LoRes %dx%d (%d mips), RefineBias=0"),
-		LoResTexture->GetSizeX(),
-		LoResTexture->GetSizeY(),
-		LoResTexture->GetNumMips());
+		TEXT("%s %dx%d (%d mips), RefineBias=%.2f"),
+		ResLabel,
+		Texture->GetSizeX(),
+		Texture->GetSizeY(),
+		Texture->GetNumMips(),
+		RefineBias);
 
 	TileMid->RecacheUniformExpressions(false);
 	TileMesh->MarkRenderDynamicDataDirty();

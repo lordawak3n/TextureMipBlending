@@ -35,8 +35,8 @@ struct FMipDebugColorEntry
 /**
  * Persistent terrain-tile stand-in for the mip-bias refine experiment.
  *
- * Phase 1: builds an honest lo-res / hi-res pair and binds only lo-res.
- * Texture swapping is not wired yet.
+ * Phase 1: honest lo-res / hi-res pair, lo-res bound at start.
+ * Phase 2: SwapKey toggles textures after SwapDelaySeconds; RefineBias stays 0 (naive pop).
  *
  * Material contract (M_TileMipBlend):
  *   Texture param  "TileTexture"
@@ -52,6 +52,7 @@ public:
 
 	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 #if WITH_EDITOR
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
@@ -71,15 +72,11 @@ public:
 
 	/**
 	 * Seconds to wait after the swap key before the bound texture actually changes.
-	 * Not used until the swap milestone.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input", meta = (ClampMin = "0.0"))
 	float SwapDelaySeconds = 0.5f;
 
-	/**
-	 * Same key upgrades lo-res -> hi-res and toggles back.
-	 * Not used until the swap milestone.
-	 */
+	/** Same key toggles lo-res <-> hi-res (after SwapDelaySeconds). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input")
 	FKey SwapKey = EKeys::One;
 
@@ -89,6 +86,18 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Fade", meta = (ClampMin = "0.0"))
 	float FadeDurationSeconds = 0.5f;
+
+	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
+		meta = (DisplayName = "Bound To Hi Res"))
+	bool bBoundToHiRes = false;
+
+	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
+		meta = (DisplayName = "Swap Scheduled"))
+	bool bSwapScheduled = false;
+
+	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
+		meta = (DisplayName = "Refine Bias"))
+	float CurrentRefineBias = 0.0f;
 
 	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
 		meta = (DisplayName = "Bound Texture"))
@@ -129,8 +138,16 @@ private:
 	void InitializeTileVisuals(bool bForceTextureRebuild);
 	void ApplyTileTransform();
 	void EnsureGeneratedTextures(bool bForceRebuild);
-	void BindLoResToMaterial(bool bForceRecreateMid);
+	void BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid);
+	void EnsureTextureResourceReady(UTexture2D* Texture);
+	void LogMaterialTextureParameterNames() const;
 	void RefreshMipColorDebugInfo();
+	void SetupSwapInput();
+	void HandleSwapKeyPressed();
+	void ApplyPendingTextureSwap();
+
+	bool bPendingBindHiRes = false;
+	FTimerHandle SwapDelayTimerHandle;
 
 	UTexture2D* CreateSolidMipTexture(int32 SizeX, FName DebugName);
 	void FillMipSolidColor(UTexture2D* Texture, int32 MipIndex, FColor Color);
