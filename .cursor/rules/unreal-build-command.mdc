@@ -5,9 +5,13 @@ alwaysApply: true
 
 # Build game / run game
 
-When the user asks to **build game** or **run game** (or clearly equivalent phrasing like **compile the game** for this project), run **`BuildGame.cmd`** only—**do not** chain **`LaunchProject.cmd`** unless they explicitly ask to **build and launch** or **open the editor after building**.
+When the user asks to **build game** or **run game** (or clearly equivalent phrasing like **compile the game** for this project), run **`BuildGame.cmd`** or **`Build.cmd`** (alias)—**do not** chain **`LaunchProject.cmd`** unless they explicitly ask to **build and launch** or **open the editor after building**.
 
 **Build** (from the `TextureMipBlending` folder in PowerShell):
+
+```powershell
+.\Build.cmd
+```
 
 ```powershell
 .\BuildGame.cmd
@@ -29,7 +33,11 @@ When the user asks to **build game** or **run game** (or clearly equivalent phra
 
 # Launch editor / open project (separate script)
 
-When the user asks to **open the project**, **launch Unreal**, **launch the editor**, or **run LaunchProject**, use **`LaunchProject.cmd`** only (still **not** combined with build unless they ask for both steps):
+When the user asks to **open the project**, **launch Unreal**, **launch the editor**, **run LaunchProject**, or **run LaunchGame**, use **`LaunchProject.cmd`** or **`LaunchGame.cmd`** (alias) only (still **not** combined with build unless they ask for both steps):
+
+```powershell
+.\LaunchGame.cmd
+```
 
 ```powershell
 .\LaunchProject.cmd
@@ -46,7 +54,7 @@ When the user asks to **open the project**, **launch Unreal**, **launch the edit
 PowerShell notes:
 
 - Use **`&`** before quoted commands.
-- Bare **`BuildGame.cmd`** / **`LaunchProject.cmd`** **fail**—use **`.\`** when the shell’s current directory is the project folder.
+- Bare **`Build.cmd`** / **`BuildGame.cmd`** / **`LaunchGame.cmd`** / **`LaunchProject.cmd`** **fail**—use **`.\`** when the shell’s current directory is the project folder.
 - Do not use MSBuild macros like **`$(BuildBatchScript)`** in the terminal.
 
 Do **not** use this rule for generic **build** / **compile** / **run** requests that do not refer to this game workflow unless the user ties them to it.

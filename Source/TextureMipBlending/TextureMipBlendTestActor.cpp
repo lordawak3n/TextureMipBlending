@@ -20,6 +20,7 @@ namespace TextureMipBlend
 {
 	static const FName TextureParamName(TEXT("TileTexture"));
 	static const FName RefineBiasParamName(TEXT("RefineBias"));
+	static const FName RefineMinMipParamName(TEXT("RefineMinMip"));
 	static constexpr int32 BytesPerPixel = 4;
 }
 
@@ -64,16 +65,33 @@ void ATextureMipBlendTestActor::BeginPlay()
 	bSwapScheduled = false;
 	bPendingBindHiRes = false;
 	CurrentRefineBias = 0.0f;
+	CurrentRefineMinMip = 0.0f;
 
 	// PIE duplicates can retain editor-world texture pointers or a MID that still samples the material default.
 	InitializeTileVisuals(/*bForceTextureRebuild=*/true);
 	SetupSwapInput();
 
+	const TCHAR* ModeLabel = TEXT("BiasFrozenAtUpgrade");
+	if (SwapRefineMode == ETextureMipBlendSwapMode::Naive)
+	{
+		ModeLabel = TEXT("Naive");
+	}
+	else if (SwapRefineMode == ETextureMipBlendSwapMode::Fade)
+	{
+		ModeLabel = TEXT("Fade (not implemented yet — using frozen MinMip)");
+	}
+	else
+	{
+		ModeLabel = TEXT("MinMipFrozenAtUpgrade");
+	}
+
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("%s Phase 2 ready: %dx%d lo-res bound (RefineBias=0). Press '%s' to toggle hi-res after %.2fs delay. Expect green->red pop on upgrade."),
+		TEXT("%s Phase 3 ready: %dx%d lo-res bound. Mode=%s (UpgradeMinMip=%.2f). Material must use RefineMinMip clamp, not bias-only. Press '%s' after %.2fs."),
 		*GetName(),
 		LoResTexture ? LoResTexture->GetSizeX() : 0,
 		LoResTexture ? LoResTexture->GetSizeY() : 0,
+		ModeLabel,
+		UpgradeRefineBias,
 		*SwapKey.GetDisplayName().ToString(),
 		SwapDelaySeconds);
 }
@@ -131,12 +149,16 @@ void ATextureMipBlendTestActor::HandleSwapKeyPressed()
 	}
 
 	bSwapScheduled = true;
+	float ExpectedBias = 0.0f;
+	float ExpectedMinMip = 0.0f;
+	ComputeRefineScalarsForBind(bPendingBindHiRes, ExpectedBias, ExpectedMinMip);
 	const FString TargetLabel = bPendingBindHiRes
-		? FString::Printf(TEXT("HiRes %dx%d (close pixels should go Red)"), HiResTexture->GetSizeX(), HiResTexture->GetSizeY())
-		: FString::Printf(TEXT("LoRes %dx%d (close pixels should go Green)"), LoResTexture->GetSizeX(), LoResTexture->GetSizeY());
+		? FString::Printf(TEXT("HiRes %dx%d (RefineMinMip=%.2f, RefineBias=%.2f)"),
+			HiResTexture->GetSizeX(), HiResTexture->GetSizeY(), ExpectedMinMip, ExpectedBias)
+		: FString::Printf(TEXT("LoRes %dx%d (RefineMinMip=0)"), LoResTexture->GetSizeX(), LoResTexture->GetSizeY());
 
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("%s: '%s' pressed — swapping to %s in %.2fs (RefineBias stays 0)."),
+		TEXT("%s: '%s' pressed — swapping to %s in %.2fs."),
 		*GetName(),
 		*SwapKey.GetDisplayName().ToString(),
 		*TargetLabel,
@@ -163,13 +185,27 @@ void ATextureMipBlendTestActor::ApplyPendingTextureSwap()
 	}
 
 	const bool bWasLoRes = !bBoundToHiRes;
-	BindTextureToMaterial(TextureToBind, bPendingBindHiRes, /*bForceRecreateMid=*/false);
+	float RefineBias = 0.0f;
+	float RefineMinMip = 0.0f;
+	ComputeRefineScalarsForBind(bPendingBindHiRes, RefineBias, RefineMinMip);
+	BindTextureToMaterial(TextureToBind, bPendingBindHiRes, /*bForceRecreateMid=*/false, RefineBias, RefineMinMip);
 
 	if (bWasLoRes && bBoundToHiRes)
 	{
-		UE_LOG(LogTextureMipBlend, Display,
-			TEXT("%s: NAIVE hi-res bind complete — close pixels should snap Green -> Red (resolution pop)."),
-			*GetName());
+		if (SwapRefineMode == ETextureMipBlendSwapMode::Naive)
+		{
+			UE_LOG(LogTextureMipBlend, Display,
+				TEXT("%s: NAIVE hi-res bind — close pixels should snap Green -> Red (resolution pop)."),
+				*GetName());
+		}
+		else
+		{
+			UE_LOG(LogTextureMipBlend, Display,
+				TEXT("%s: hi-res bind RefineMinMip=%.2f RefineBias=%.2f — close pixels should stay Green; distant mips unchanged."),
+				*GetName(),
+				CurrentRefineMinMip,
+				CurrentRefineBias);
+		}
 	}
 	else if (!bWasLoRes && !bBoundToHiRes)
 	{
@@ -208,8 +244,44 @@ void ATextureMipBlendTestActor::InitializeTileVisuals(bool bForceTextureRebuild)
 
 	if (LoResTexture)
 	{
-		BindTextureToMaterial(LoResTexture, /*bIsHiResBinding=*/false, /*bForceRecreateMid=*/true);
+		BindTextureToMaterial(LoResTexture, /*bIsHiResBinding=*/false, /*bForceRecreateMid=*/true, /*RefineBias=*/0.0f, /*RefineMinMip=*/0.0f);
 	}
+}
+
+void ATextureMipBlendTestActor::ComputeRefineScalarsForBind(bool bIsHiResBinding, float& OutRefineBias, float& OutRefineMinMip) const
+{
+	OutRefineBias = 0.0f;
+	OutRefineMinMip = 0.0f;
+
+	switch (SwapRefineMode)
+	{
+	case ETextureMipBlendSwapMode::Naive:
+		return;
+
+	case ETextureMipBlendSwapMode::BiasFrozenAtUpgrade:
+	case ETextureMipBlendSwapMode::Fade:
+		if (bIsHiResBinding)
+		{
+			// Clamp finest mip: max(LOD, RefineMinMip). Constant MipBias +1 fails when LOD <= 0 on hi-res.
+			OutRefineMinMip = GetUpgradeRefineBias();
+			OutRefineBias = 0.0f;
+		}
+		return;
+
+	default:
+		return;
+	}
+}
+
+float ATextureMipBlendTestActor::GetUpgradeRefineBias() const
+{
+	if (LoResSize <= 0)
+	{
+		return 0.0f;
+	}
+
+	const int32 HiResSize = LoResSize * 2;
+	return FMath::Log2(static_cast<float>(HiResSize) / static_cast<float>(LoResSize));
 }
 
 void ATextureMipBlendTestActor::ApplyTileTransform()
@@ -458,6 +530,8 @@ void ATextureMipBlendTestActor::EnsureGeneratedTextures(bool bForceRebuild)
 
 	RefreshMipColorDebugInfo();
 
+	UpgradeRefineBias = GetUpgradeRefineBias();
+
 	UE_LOG(LogTextureMipBlend, Display,
 		TEXT("Built honest texture pair: lo-res %d (%d mips, finest=%s) is an exact copy of hi-res %d mips [1..%d] (hi-res finest=%s)."),
 		LoResSize,
@@ -512,7 +586,28 @@ void ATextureMipBlendTestActor::LogMaterialTextureParameterNames() const
 	}
 }
 
-void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid)
+void ATextureMipBlendTestActor::LogMaterialScalarParameterNames() const
+{
+	if (!TileMaterial)
+	{
+		return;
+	}
+
+	TArray<FMaterialParameterInfo> ParameterInfos;
+	TArray<FGuid> ParameterIds;
+	TileMaterial->GetAllScalarParameterInfo(ParameterInfos, ParameterIds);
+
+	for (const FMaterialParameterInfo& Info : ParameterInfos)
+	{
+		UE_LOG(LogTextureMipBlend, Display,
+			TEXT("%s: material '%s' scalar parameter '%s'"),
+			*GetName(),
+			*TileMaterial->GetName(),
+			*Info.Name.ToString());
+	}
+}
+
+void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid, float RefineBias, float RefineMinMip)
 {
 	if (!TileMesh || !Texture)
 	{
@@ -553,14 +648,14 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 		}
 	}
 
-	// Phase 2: naive swap — no mip bias fade.
-	const float RefineBias = 0.0f;
-
+	// Texture + refine scalars in one bind (atomic from the material's point of view).
 	const FMaterialParameterInfo TextureParamInfo(TextureMipBlend::TextureParamName);
 	const FMaterialParameterInfo BiasParamInfo(TextureMipBlend::RefineBiasParamName);
+	const FMaterialParameterInfo MinMipParamInfo(TextureMipBlend::RefineMinMipParamName);
 
 	TileMid->SetTextureParameterValueByInfo(TextureParamInfo, Texture);
 	TileMid->SetScalarParameterValueByInfo(BiasParamInfo, RefineBias);
+	TileMid->SetScalarParameterValueByInfo(MinMipParamInfo, RefineMinMip);
 
 	// Apply MID to mesh after parameters are set (order matters for some render paths).
 	TileMesh->SetMaterial(0, TileMid);
@@ -580,23 +675,26 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 	else
 	{
 		UE_LOG(LogTextureMipBlend, Display,
-			TEXT("%s: bound '%s' on MID '%s' (mesh slot 0, RefineBias=%.2f)."),
+			TEXT("%s: bound '%s' on MID '%s' (RefineMinMip=%.2f, RefineBias=%.2f)."),
 			*GetName(),
 			*Texture->GetName(),
 			*TileMid->GetName(),
+			RefineMinMip,
 			RefineBias);
 	}
 
 	bBoundToHiRes = bIsHiResBinding;
 	CurrentRefineBias = RefineBias;
+	CurrentRefineMinMip = RefineMinMip;
 
 	const TCHAR* ResLabel = bIsHiResBinding ? TEXT("HiRes") : TEXT("LoRes");
 	BoundTextureDescription = FString::Printf(
-		TEXT("%s %dx%d (%d mips), RefineBias=%.2f"),
+		TEXT("%s %dx%d (%d mips), RefineMinMip=%.2f, RefineBias=%.2f"),
 		ResLabel,
 		Texture->GetSizeX(),
 		Texture->GetSizeY(),
 		Texture->GetNumMips(),
+		RefineMinMip,
 		RefineBias);
 
 	TileMid->RecacheUniformExpressions(false);

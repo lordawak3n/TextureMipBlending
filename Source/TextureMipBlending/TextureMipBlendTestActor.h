@@ -32,15 +32,31 @@ struct FMipDebugColorEntry
 	FColor Color = FColor::Black;
 };
 
+/** How RefineBias is applied when swapping textures (Phase 2 vs Phase 3). */
+UENUM(BlueprintType)
+enum class ETextureMipBlendSwapMode : uint8
+{
+	/** RefineBias always 0 — expect green->red pop on hi-res upgrade (Phase 2). */
+	Naive UMETA(DisplayName = "Naive (Bias = 0)"),
+
+	/** On hi-res bind, RefineMinMip = log2(hi/lo) and RefineBias = 0 (Phase 3). Requires material MinMip shader. */
+	BiasFrozenAtUpgrade UMETA(DisplayName = "Min Mip Frozen At Upgrade"),
+
+	/** Animate RefineMinMip down to 0 after hi-res bind (Phase 4). */
+	Fade UMETA(DisplayName = "Fade (MinMip to 0)")
+};
+
 /**
  * Persistent terrain-tile stand-in for the mip-bias refine experiment.
  *
  * Phase 1: honest lo-res / hi-res pair, lo-res bound at start.
- * Phase 2: SwapKey toggles textures after SwapDelaySeconds; RefineBias stays 0 (naive pop).
+ * Phase 2: SwapKey toggles textures; SwapRefineMode = Naive (RefineBias 0, pop).
+ * Phase 3: SwapRefineMode = BiasFrozenAtUpgrade (RefineMinMip = log2(hi/lo), RefineBias = 0).
  *
  * Material contract (M_TileMipBlend):
- *   Texture param  "TileTexture"
- *   Scalar param   "RefineBias"
+ *   Texture param   "TileTexture"
+ *   Scalar param    "RefineBias"    (optional offset; keep 0 for frozen mode)
+ *   Scalar param    "RefineMinMip"  (clamp: mip = max(LOD, RefineMinMip) — see material setup)
  */
 UCLASS(Blueprintable, BlueprintType)
 class TEXTUREMIPBLENDING_API ATextureMipBlendTestActor : public AActor
@@ -80,12 +96,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input")
 	FKey SwapKey = EKeys::One;
 
+	/** Controls RefineBias behavior when swapping lo-res <-> hi-res. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Refine")
+	ETextureMipBlendSwapMode SwapRefineMode = ETextureMipBlendSwapMode::BiasFrozenAtUpgrade;
+
 	/**
-	 * Duration of the RefineBias +1 -> 0 fade after a hi-res bind.
-	 * Not used until the fade milestone.
+	 * Duration of the RefineBias +1 -> 0 fade after a hi-res bind (SwapRefineMode = Fade only).
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Fade", meta = (ClampMin = "0.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Refine",
+		meta = (ClampMin = "0.0", EditCondition = "SwapRefineMode == ETextureMipBlendSwapMode::Fade", EditConditionHides))
 	float FadeDurationSeconds = 0.5f;
+
+	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
+		meta = (DisplayName = "Upgrade Refine Bias"))
+	float UpgradeRefineBias = 1.0f;
 
 	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
 		meta = (DisplayName = "Bound To Hi Res"))
@@ -94,6 +118,10 @@ public:
 	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
 		meta = (DisplayName = "Swap Scheduled"))
 	bool bSwapScheduled = false;
+
+	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
+		meta = (DisplayName = "Refine Min Mip"))
+	float CurrentRefineMinMip = 0.0f;
 
 	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
 		meta = (DisplayName = "Refine Bias"))
@@ -138,7 +166,10 @@ private:
 	void InitializeTileVisuals(bool bForceTextureRebuild);
 	void ApplyTileTransform();
 	void EnsureGeneratedTextures(bool bForceRebuild);
-	void BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid);
+	void BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid, float RefineBias, float RefineMinMip);
+	float GetUpgradeRefineBias() const;
+	void ComputeRefineScalarsForBind(bool bIsHiResBinding, float& OutRefineBias, float& OutRefineMinMip) const;
+	void LogMaterialScalarParameterNames() const;
 	void EnsureTextureResourceReady(UTexture2D* Texture);
 	void LogMaterialTextureParameterNames() const;
 	void RefreshMipColorDebugInfo();
