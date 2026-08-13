@@ -26,7 +26,8 @@ namespace TextureMipBlend
 
 ATextureMipBlendTestActor::ATextureMipBlendTestActor()
 {
-	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = false;
 
 	TileMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("TileMesh"));
 	SetRootComponent(TileMesh);
@@ -64,6 +65,9 @@ void ATextureMipBlendTestActor::BeginPlay()
 	bBoundToHiRes = false;
 	bSwapScheduled = false;
 	bPendingBindHiRes = false;
+	bRefineFadeActive = false;
+	RefineFadeElapsedSeconds = 0.0f;
+	RefineFadeStartMinMip = 0.0f;
 	CurrentRefineBias = 0.0f;
 	CurrentRefineMinMip = 0.0f;
 
@@ -71,33 +75,63 @@ void ATextureMipBlendTestActor::BeginPlay()
 	InitializeTileVisuals(/*bForceTextureRebuild=*/true);
 	SetupSwapInput();
 
-	const TCHAR* ModeLabel = TEXT("BiasFrozenAtUpgrade");
+	const TCHAR* ModeLabel = TEXT("MinMipFrozenAtUpgrade");
 	if (SwapRefineMode == ETextureMipBlendSwapMode::Naive)
 	{
 		ModeLabel = TEXT("Naive");
 	}
 	else if (SwapRefineMode == ETextureMipBlendSwapMode::Fade)
 	{
-		ModeLabel = TEXT("Fade (not implemented yet — using frozen MinMip)");
-	}
-	else
-	{
-		ModeLabel = TEXT("MinMipFrozenAtUpgrade");
+		ModeLabel = TEXT("Fade");
 	}
 
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("%s Phase 3 ready: %dx%d lo-res bound. Mode=%s (UpgradeMinMip=%.2f). Material must use RefineMinMip clamp, not bias-only. Press '%s' after %.2fs."),
+		TEXT("%s Phase 4 ready: %dx%d lo-res bound. Mode=%s (UpgradeMinMip=%.2f). '%s'=lo-res, '%s'=hi-res (%.2fs delay)."),
 		*GetName(),
 		LoResTexture ? LoResTexture->GetSizeX() : 0,
 		LoResTexture ? LoResTexture->GetSizeY() : 0,
 		ModeLabel,
 		UpgradeRefineBias,
-		*SwapKey.GetDisplayName().ToString(),
+		*LoResKey.GetDisplayName().ToString(),
+		*HiResKey.GetDisplayName().ToString(),
 		SwapDelaySeconds);
+}
+
+void ATextureMipBlendTestActor::Tick(float DeltaSeconds)
+{
+	if (!bRefineFadeActive || !bBoundToHiRes || !TileMid)
+	{
+		return;
+	}
+
+	if (FadeDurationSeconds <= 0.0f)
+	{
+		ApplyRefineScalarsToMid(0.0f, 0.0f);
+		StopRefineMinMipFade();
+		UE_LOG(LogTextureMipBlend, Display, TEXT("%s: RefineMinMip fade skipped (FadeDurationSeconds=0)."), *GetName());
+		return;
+	}
+
+	RefineFadeElapsedSeconds += DeltaSeconds;
+	const float Alpha = FMath::Clamp(RefineFadeElapsedSeconds / FadeDurationSeconds, 0.0f, 1.0f);
+	const float EasedAlpha = FMath::SmoothStep(0.0f, 1.0f, Alpha);
+	const float RefineMinMip = RefineFadeStartMinMip * (1.0f - EasedAlpha);
+
+	ApplyRefineScalarsToMid(0.0f, RefineMinMip);
+
+	if (Alpha >= 1.0f)
+	{
+		StopRefineMinMipFade();
+		UE_LOG(LogTextureMipBlend, Display,
+			TEXT("%s: RefineMinMip fade complete — close pixels should reach full hi-res sharpness (red)."),
+			*GetName());
+	}
 }
 
 void ATextureMipBlendTestActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	StopRefineMinMipFade();
+
 	if (GetWorld())
 	{
 		GetWorldTimerManager().ClearTimer(SwapDelayTimerHandle);
@@ -117,14 +151,25 @@ void ATextureMipBlendTestActor::SetupSwapInput()
 
 	if (!InputComponent)
 	{
-		UE_LOG(LogTextureMipBlend, Warning, TEXT("%s has no InputComponent; swap key will not work."), *GetName());
+		UE_LOG(LogTextureMipBlend, Warning, TEXT("%s has no InputComponent; bind keys will not work."), *GetName());
 		return;
 	}
 
-	InputComponent->BindKey(SwapKey, IE_Pressed, this, &ATextureMipBlendTestActor::HandleSwapKeyPressed);
+	InputComponent->BindKey(LoResKey, IE_Pressed, this, &ATextureMipBlendTestActor::HandleLoResKeyPressed);
+	InputComponent->BindKey(HiResKey, IE_Pressed, this, &ATextureMipBlendTestActor::HandleHiResKeyPressed);
 }
 
-void ATextureMipBlendTestActor::HandleSwapKeyPressed()
+void ATextureMipBlendTestActor::HandleLoResKeyPressed()
+{
+	RequestTextureBind(/*bBindHiRes=*/false, LoResKey);
+}
+
+void ATextureMipBlendTestActor::HandleHiResKeyPressed()
+{
+	RequestTextureBind(/*bBindHiRes=*/true, HiResKey);
+}
+
+void ATextureMipBlendTestActor::RequestTextureBind(bool bBindHiRes, const FKey& SourceKey)
 {
 	if (!GetWorld() || !LoResTexture || !HiResTexture)
 	{
@@ -134,17 +179,18 @@ void ATextureMipBlendTestActor::HandleSwapKeyPressed()
 	if (bSwapScheduled)
 	{
 		UE_LOG(LogTextureMipBlend, Warning,
-			TEXT("%s: swap already scheduled (waiting %.2fs). Ignoring duplicate key press."),
+			TEXT("%s: bind already scheduled (waiting %.2fs). Ignoring '%s'."),
 			*GetName(),
-			GetWorldTimerManager().GetTimerRemaining(SwapDelayTimerHandle));
+			GetWorldTimerManager().GetTimerRemaining(SwapDelayTimerHandle),
+			*SourceKey.GetDisplayName().ToString());
 		return;
 	}
 
-	bPendingBindHiRes = !bBoundToHiRes;
+	bPendingBindHiRes = bBindHiRes;
 
 	if (SwapDelaySeconds <= 0.0f)
 	{
-		ApplyPendingTextureSwap();
+		ApplyPendingTextureBind();
 		return;
 	}
 
@@ -152,27 +198,27 @@ void ATextureMipBlendTestActor::HandleSwapKeyPressed()
 	float ExpectedBias = 0.0f;
 	float ExpectedMinMip = 0.0f;
 	ComputeRefineScalarsForBind(bPendingBindHiRes, ExpectedBias, ExpectedMinMip);
+
 	const FString TargetLabel = bPendingBindHiRes
-		? FString::Printf(TEXT("HiRes %dx%d (RefineMinMip=%.2f, RefineBias=%.2f)"),
-			HiResTexture->GetSizeX(), HiResTexture->GetSizeY(), ExpectedMinMip, ExpectedBias)
-		: FString::Printf(TEXT("LoRes %dx%d (RefineMinMip=0)"), LoResTexture->GetSizeX(), LoResTexture->GetSizeY());
+		? FString::Printf(TEXT("HiRes %dx%d (start RefineMinMip=%.2f)"), HiResTexture->GetSizeX(), HiResTexture->GetSizeY(), ExpectedMinMip)
+		: FString::Printf(TEXT("LoRes %dx%d"), LoResTexture->GetSizeX(), LoResTexture->GetSizeY());
 
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("%s: '%s' pressed — swapping to %s in %.2fs."),
+		TEXT("%s: '%s' pressed — binding %s in %.2fs."),
 		*GetName(),
-		*SwapKey.GetDisplayName().ToString(),
+		*SourceKey.GetDisplayName().ToString(),
 		*TargetLabel,
 		SwapDelaySeconds);
 
 	GetWorldTimerManager().SetTimer(
 		SwapDelayTimerHandle,
 		this,
-		&ATextureMipBlendTestActor::ApplyPendingTextureSwap,
+		&ATextureMipBlendTestActor::ApplyPendingTextureBind,
 		SwapDelaySeconds,
 		false);
 }
 
-void ATextureMipBlendTestActor::ApplyPendingTextureSwap()
+void ATextureMipBlendTestActor::ApplyPendingTextureBind()
 {
 	bSwapScheduled = false;
 	GetWorldTimerManager().ClearTimer(SwapDelayTimerHandle);
@@ -180,9 +226,11 @@ void ATextureMipBlendTestActor::ApplyPendingTextureSwap()
 	UTexture2D* TextureToBind = bPendingBindHiRes ? HiResTexture.Get() : LoResTexture.Get();
 	if (!TextureToBind)
 	{
-		UE_LOG(LogTextureMipBlend, Error, TEXT("%s: pending texture swap failed — target texture is null."), *GetName());
+		UE_LOG(LogTextureMipBlend, Error, TEXT("%s: pending texture bind failed — target texture is null."), *GetName());
 		return;
 	}
+
+	StopRefineMinMipFade();
 
 	const bool bWasLoRes = !bBoundToHiRes;
 	float RefineBias = 0.0f;
@@ -190,28 +238,34 @@ void ATextureMipBlendTestActor::ApplyPendingTextureSwap()
 	ComputeRefineScalarsForBind(bPendingBindHiRes, RefineBias, RefineMinMip);
 	BindTextureToMaterial(TextureToBind, bPendingBindHiRes, /*bForceRecreateMid=*/false, RefineBias, RefineMinMip);
 
-	if (bWasLoRes && bBoundToHiRes)
+	if (bPendingBindHiRes && SwapRefineMode == ETextureMipBlendSwapMode::Fade)
+	{
+		StartRefineMinMipFade();
+		UE_LOG(LogTextureMipBlend, Display,
+			TEXT("%s: hi-res bound — RefineMinMip fading %.2f -> 0 over %.2fs (close: green -> red)."),
+			*GetName(),
+			RefineFadeStartMinMip,
+			FadeDurationSeconds);
+	}
+	else if (bWasLoRes && bBoundToHiRes)
 	{
 		if (SwapRefineMode == ETextureMipBlendSwapMode::Naive)
 		{
 			UE_LOG(LogTextureMipBlend, Display,
-				TEXT("%s: NAIVE hi-res bind — close pixels should snap Green -> Red (resolution pop)."),
+				TEXT("%s: NAIVE hi-res bind — close pixels should snap Green -> Red."),
 				*GetName());
 		}
 		else
 		{
 			UE_LOG(LogTextureMipBlend, Display,
-				TEXT("%s: hi-res bind RefineMinMip=%.2f RefineBias=%.2f — close pixels should stay Green; distant mips unchanged."),
+				TEXT("%s: hi-res bind RefineMinMip=%.2f — close pixels should stay Green."),
 				*GetName(),
-				CurrentRefineMinMip,
-				CurrentRefineBias);
+				CurrentRefineMinMip);
 		}
 	}
 	else if (!bWasLoRes && !bBoundToHiRes)
 	{
-		UE_LOG(LogTextureMipBlend, Display,
-			TEXT("%s: reverted to lo-res — close pixels should snap Red -> Green."),
-			*GetName());
+		UE_LOG(LogTextureMipBlend, Display, TEXT("%s: lo-res bound (RefineMinMip=0)."), *GetName());
 	}
 }
 
@@ -282,6 +336,39 @@ float ATextureMipBlendTestActor::GetUpgradeRefineBias() const
 
 	const int32 HiResSize = LoResSize * 2;
 	return FMath::Log2(static_cast<float>(HiResSize) / static_cast<float>(LoResSize));
+}
+
+void ATextureMipBlendTestActor::ApplyRefineScalarsToMid(float RefineBias, float RefineMinMip)
+{
+	if (!TileMid)
+	{
+		return;
+	}
+
+	const FMaterialParameterInfo BiasParamInfo(TextureMipBlend::RefineBiasParamName);
+	const FMaterialParameterInfo MinMipParamInfo(TextureMipBlend::RefineMinMipParamName);
+
+	TileMid->SetScalarParameterValueByInfo(BiasParamInfo, RefineBias);
+	TileMid->SetScalarParameterValueByInfo(MinMipParamInfo, RefineMinMip);
+
+	CurrentRefineBias = RefineBias;
+	CurrentRefineMinMip = RefineMinMip;
+}
+
+void ATextureMipBlendTestActor::StartRefineMinMipFade()
+{
+	RefineFadeStartMinMip = CurrentRefineMinMip;
+	RefineFadeElapsedSeconds = 0.0f;
+	bRefineFadeActive = true;
+	SetActorTickEnabled(true);
+}
+
+void ATextureMipBlendTestActor::StopRefineMinMipFade()
+{
+	bRefineFadeActive = false;
+	RefineFadeElapsedSeconds = 0.0f;
+	RefineFadeStartMinMip = 0.0f;
+	SetActorTickEnabled(false);
 }
 
 void ATextureMipBlendTestActor::ApplyTileTransform()

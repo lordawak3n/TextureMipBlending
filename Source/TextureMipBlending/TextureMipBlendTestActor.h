@@ -50,8 +50,8 @@ enum class ETextureMipBlendSwapMode : uint8
  * Persistent terrain-tile stand-in for the mip-bias refine experiment.
  *
  * Phase 1: honest lo-res / hi-res pair, lo-res bound at start.
- * Phase 2: SwapKey toggles textures; SwapRefineMode = Naive (RefineBias 0, pop).
- * Phase 3: SwapRefineMode = BiasFrozenAtUpgrade (RefineMinMip = log2(hi/lo), RefineBias = 0).
+ * Phase 2: dedicated keys bind lo/hi textures; SwapRefineMode = Naive (RefineBias 0, pop).
+ * Phase 4: SwapRefineMode = Fade animates RefineMinMip from log2(hi/lo) down to 0.
  *
  * Material contract (M_TileMipBlend):
  *   Texture param   "TileTexture"
@@ -68,6 +68,7 @@ public:
 
 	virtual void OnConstruction(const FTransform& Transform) override;
 	virtual void BeginPlay() override;
+	virtual void Tick(float DeltaSeconds) override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 #if WITH_EDITOR
@@ -86,15 +87,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Textures", meta = (ClampMin = "16", ClampMax = "4096"))
 	int32 LoResSize = 512;
 
-	/**
-	 * Seconds to wait after the swap key before the bound texture actually changes.
-	 */
+	/** Seconds to wait after a bind key before the texture actually changes. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input", meta = (ClampMin = "0.0"))
 	float SwapDelaySeconds = 0.5f;
 
-	/** Same key toggles lo-res <-> hi-res (after SwapDelaySeconds). */
+	/** Bind lo-res texture (after SwapDelaySeconds). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input")
-	FKey SwapKey = EKeys::One;
+	FKey LoResKey = EKeys::One;
+
+	/** Bind hi-res texture (after SwapDelaySeconds). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input")
+	FKey HiResKey = EKeys::Two;
 
 	/** Controls RefineBias behavior when swapping lo-res <-> hi-res. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Refine")
@@ -110,6 +113,10 @@ public:
 	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
 		meta = (DisplayName = "Upgrade Refine Bias"))
 	float UpgradeRefineBias = 1.0f;
+
+	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
+		meta = (DisplayName = "Refine Fade Active"))
+	bool bRefineFadeActive = false;
 
 	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "Texture Mip Blend|Debug",
 		meta = (DisplayName = "Bound To Hi Res"))
@@ -167,6 +174,9 @@ private:
 	void ApplyTileTransform();
 	void EnsureGeneratedTextures(bool bForceRebuild);
 	void BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid, float RefineBias, float RefineMinMip);
+	void ApplyRefineScalarsToMid(float RefineBias, float RefineMinMip);
+	void StartRefineMinMipFade();
+	void StopRefineMinMipFade();
 	float GetUpgradeRefineBias() const;
 	void ComputeRefineScalarsForBind(bool bIsHiResBinding, float& OutRefineBias, float& OutRefineMinMip) const;
 	void LogMaterialScalarParameterNames() const;
@@ -174,10 +184,14 @@ private:
 	void LogMaterialTextureParameterNames() const;
 	void RefreshMipColorDebugInfo();
 	void SetupSwapInput();
-	void HandleSwapKeyPressed();
-	void ApplyPendingTextureSwap();
+	void RequestTextureBind(bool bBindHiRes, const FKey& SourceKey);
+	void HandleLoResKeyPressed();
+	void HandleHiResKeyPressed();
+	void ApplyPendingTextureBind();
 
 	bool bPendingBindHiRes = false;
+	float RefineFadeElapsedSeconds = 0.0f;
+	float RefineFadeStartMinMip = 0.0f;
 	FTimerHandle SwapDelayTimerHandle;
 
 	UTexture2D* CreateSolidMipTexture(int32 SizeX, FName DebugName);
