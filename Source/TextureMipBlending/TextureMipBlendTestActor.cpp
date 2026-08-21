@@ -20,7 +20,6 @@ DEFINE_LOG_CATEGORY_STATIC(LogTextureMipBlend, Log, All);
 namespace TextureMipBlend
 {
 	static const FName TextureParamName(TEXT("TileTexture"));
-	static const FName RefineBiasParamName(TEXT("RefineBias"));
 	static const FName RefineMinMipParamName(TEXT("RefineMinMip"));
 	static constexpr int32 BytesPerPixel = 4;
 
@@ -72,7 +71,6 @@ void ATextureMipBlendTestActor::BeginPlay()
 	bRefineFadeActive = false;
 	RefineFadeElapsedSeconds = 0.0f;
 	RefineFadeStartMinMip = 0.0f;
-	CurrentRefineBias = 0.0f;
 	CurrentRefineMinMip = 0.0f;
 
 	// PIE duplicates can retain editor-world texture pointers or a MID that still samples the material default.
@@ -89,30 +87,19 @@ void ATextureMipBlendTestActor::BeginPlay()
 		MaxAnisoCVar->Set(FMath::Clamp(MaxTextureAnisotropy, 1, 16), ECVF_SetByCode);
 	}
 
-	const TCHAR* ModeLabel = TEXT("MinMipFrozenAtUpgrade");
-	if (SwapRefineMode == ETextureMipBlendSwapMode::Naive)
-	{
-		ModeLabel = TEXT("Naive");
-	}
-	else if (SwapRefineMode == ETextureMipBlendSwapMode::Fade)
-	{
-		ModeLabel = TEXT("Fade");
-	}
-
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("%s Phase 5a ready [%s]: %dx%d lo-res bound. Mode=%s (UpgradeMinMip=%.2f). CheckerFinest=%s (%d texels/cell, aniso=%d). '%s'=lo-res, '%s'=hi-res (%.2fs delay). Place a second actor with default-sampler material for side-by-side aniso compare."),
+		TEXT("%s ready [%s]: %dx%d lo-res bound. Fade RefineMinMip %.2f -> 0 over %.2fs. Checker=%s (%d texels/cell, aniso=%d). '%s'=lo-res, '%s'=hi-res."),
 		*GetName(),
 		*SamplingLabel,
 		LoResTexture ? LoResTexture->GetSizeX() : 0,
 		LoResTexture ? LoResTexture->GetSizeY() : 0,
-		ModeLabel,
-		UpgradeRefineBias,
-		bCheckerOnFinestMips ? TEXT("yes") : TEXT("no"),
+		UpgradeRefineMinMip,
+		FadeDurationSeconds,
+		bCheckerOnFinestMips ? TEXT("on") : TEXT("off"),
 		CheckerTexelsPerCell,
 		MaxTextureAnisotropy,
 		*LoResKey.GetDisplayName().ToString(),
-		*HiResKey.GetDisplayName().ToString(),
-		SwapDelaySeconds);
+		*HiResKey.GetDisplayName().ToString());
 }
 
 void ATextureMipBlendTestActor::Tick(float DeltaSeconds)
@@ -124,7 +111,7 @@ void ATextureMipBlendTestActor::Tick(float DeltaSeconds)
 
 	if (FadeDurationSeconds <= 0.0f)
 	{
-		ApplyRefineScalarsToMid(0.0f, 0.0f);
+		ApplyRefineMinMipToMid(0.0f);
 		StopRefineMinMipFade();
 		UE_LOG(LogTextureMipBlend, Display, TEXT("%s: RefineMinMip fade skipped (FadeDurationSeconds=0)."), *GetName());
 		return;
@@ -135,7 +122,7 @@ void ATextureMipBlendTestActor::Tick(float DeltaSeconds)
 	const float EasedAlpha = FMath::SmoothStep(0.0f, 1.0f, Alpha);
 	const float RefineMinMip = RefineFadeStartMinMip * (1.0f - EasedAlpha);
 
-	ApplyRefineScalarsToMid(0.0f, RefineMinMip);
+	ApplyRefineMinMipToMid(RefineMinMip);
 
 	if (Alpha >= 1.0f)
 	{
@@ -291,9 +278,7 @@ void ATextureMipBlendTestActor::RequestTextureBind(bool bBindHiRes, const FKey& 
 	}
 
 	bSwapScheduled = true;
-	float ExpectedBias = 0.0f;
-	float ExpectedMinMip = 0.0f;
-	ComputeRefineScalarsForBind(bPendingBindHiRes, ExpectedBias, ExpectedMinMip);
+	const float ExpectedMinMip = GetRefineMinMipForBind(bPendingBindHiRes);
 
 	const FString TargetLabel = bPendingBindHiRes
 		? FString::Printf(TEXT("HiRes %dx%d (start RefineMinMip=%.2f)"), HiResTexture->GetSizeX(), HiResTexture->GetSizeY(), ExpectedMinMip)
@@ -329,37 +314,19 @@ void ATextureMipBlendTestActor::ApplyPendingTextureBind()
 	StopRefineMinMipFade();
 
 	const bool bWasLoRes = !bBoundToHiRes;
-	float RefineBias = 0.0f;
-	float RefineMinMip = 0.0f;
-	ComputeRefineScalarsForBind(bPendingBindHiRes, RefineBias, RefineMinMip);
-	BindTextureToMaterial(TextureToBind, bPendingBindHiRes, /*bForceRecreateMid=*/false, RefineBias, RefineMinMip);
+	const float RefineMinMip = GetRefineMinMipForBind(bPendingBindHiRes);
+	BindTextureToMaterial(TextureToBind, bPendingBindHiRes, /*bForceRecreateMid=*/false, RefineMinMip);
 
-	if (bPendingBindHiRes && SwapRefineMode == ETextureMipBlendSwapMode::Fade)
+	if (bPendingBindHiRes)
 	{
 		StartRefineMinMipFade();
 		UE_LOG(LogTextureMipBlend, Display,
-			TEXT("%s: hi-res bound — RefineMinMip fading %.2f -> 0 over %.2fs (close: green -> red)."),
+			TEXT("%s: hi-res bound — RefineMinMip fading %.2f -> 0 over %.2fs."),
 			*GetName(),
 			RefineFadeStartMinMip,
 			FadeDurationSeconds);
 	}
-	else if (bWasLoRes && bBoundToHiRes)
-	{
-		if (SwapRefineMode == ETextureMipBlendSwapMode::Naive)
-		{
-			UE_LOG(LogTextureMipBlend, Display,
-				TEXT("%s: NAIVE hi-res bind — close pixels should snap Green -> Red."),
-				*GetName());
-		}
-		else
-		{
-			UE_LOG(LogTextureMipBlend, Display,
-				TEXT("%s: hi-res bind RefineMinMip=%.2f — close pixels should stay Green."),
-				*GetName(),
-				CurrentRefineMinMip);
-		}
-	}
-	else if (!bWasLoRes && !bBoundToHiRes)
+	else if (!bWasLoRes)
 	{
 		UE_LOG(LogTextureMipBlend, Display, TEXT("%s: lo-res bound (RefineMinMip=0)."), *GetName());
 	}
@@ -371,9 +338,14 @@ void ATextureMipBlendTestActor::PostEditChangeProperty(FPropertyChangedEvent& Pr
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 
 	const FName PropertyName = PropertyChangedEvent.GetPropertyName();
+	if (PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, TileMeshScale))
+	{
+		ApplyTileTransform();
+		return;
+	}
+
 	if (PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, LoResSize)
 		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, TileMaterial)
-		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, TileExtentCm)
 		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, bCheckerOnFinestMips)
 		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, CheckerTexelsPerCell)
 		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, MaxTextureAnisotropy))
@@ -395,41 +367,20 @@ void ATextureMipBlendTestActor::PostEditChangeProperty(FPropertyChangedEvent& Pr
 
 void ATextureMipBlendTestActor::InitializeTileVisuals(bool bForceTextureRebuild)
 {
-	ApplyTileTransform();
 	EnsureGeneratedTextures(bForceTextureRebuild);
 
 	if (LoResTexture)
 	{
-		BindTextureToMaterial(LoResTexture, /*bIsHiResBinding=*/false, /*bForceRecreateMid=*/true, /*RefineBias=*/0.0f, /*RefineMinMip=*/0.0f);
+		BindTextureToMaterial(LoResTexture, /*bIsHiResBinding=*/false, /*bForceRecreateMid=*/true, /*RefineMinMip=*/0.0f);
 	}
 }
 
-void ATextureMipBlendTestActor::ComputeRefineScalarsForBind(bool bIsHiResBinding, float& OutRefineBias, float& OutRefineMinMip) const
+float ATextureMipBlendTestActor::GetRefineMinMipForBind(bool bIsHiResBinding) const
 {
-	OutRefineBias = 0.0f;
-	OutRefineMinMip = 0.0f;
-
-	switch (SwapRefineMode)
-	{
-	case ETextureMipBlendSwapMode::Naive:
-		return;
-
-	case ETextureMipBlendSwapMode::BiasFrozenAtUpgrade:
-	case ETextureMipBlendSwapMode::Fade:
-		if (bIsHiResBinding)
-		{
-			// Clamp finest mip: max(LOD, RefineMinMip). Constant MipBias +1 fails when LOD <= 0 on hi-res.
-			OutRefineMinMip = GetUpgradeRefineBias();
-			OutRefineBias = 0.0f;
-		}
-		return;
-
-	default:
-		return;
-	}
+	return bIsHiResBinding ? GetUpgradeRefineMinMip() : 0.0f;
 }
 
-float ATextureMipBlendTestActor::GetUpgradeRefineBias() const
+float ATextureMipBlendTestActor::GetUpgradeRefineMinMip() const
 {
 	if (LoResSize <= 0)
 	{
@@ -452,24 +403,19 @@ int32 ATextureMipBlendTestActor::GetCheckerTexelsPerCellForMipSize(int32 MipSize
 	return FMath::Clamp(MipSize / CellsPerEdge, 2, MipSize);
 }
 
-void ATextureMipBlendTestActor::ApplyRefineScalarsToMid(float RefineBias, float RefineMinMip)
+void ATextureMipBlendTestActor::ApplyRefineMinMipToMid(float RefineMinMip)
 {
-	if (!TileMid || !MaterialSupportsRefineScalars())
+	if (!TileMid || !MaterialSupportsRefineMinMip())
 	{
 		return;
 	}
 
-	const FMaterialParameterInfo BiasParamInfo(TextureMipBlend::RefineBiasParamName);
 	const FMaterialParameterInfo MinMipParamInfo(TextureMipBlend::RefineMinMipParamName);
-
-	TileMid->SetScalarParameterValueByInfo(BiasParamInfo, RefineBias);
 	TileMid->SetScalarParameterValueByInfo(MinMipParamInfo, RefineMinMip);
-
-	CurrentRefineBias = RefineBias;
 	CurrentRefineMinMip = RefineMinMip;
 }
 
-bool ATextureMipBlendTestActor::MaterialSupportsRefineScalars() const
+bool ATextureMipBlendTestActor::MaterialSupportsRefineMinMip() const
 {
 	if (!TileMaterial)
 	{
@@ -480,21 +426,15 @@ bool ATextureMipBlendTestActor::MaterialSupportsRefineScalars() const
 	TArray<FGuid> ScalarIds;
 	TileMaterial->GetAllScalarParameterInfo(ScalarInfos, ScalarIds);
 
-	bool bHasBias = false;
-	bool bHasMinMip = false;
 	for (const FMaterialParameterInfo& Info : ScalarInfos)
 	{
-		if (Info.Name == TextureMipBlend::RefineBiasParamName)
+		if (Info.Name == TextureMipBlend::RefineMinMipParamName)
 		{
-			bHasBias = true;
-		}
-		else if (Info.Name == TextureMipBlend::RefineMinMipParamName)
-		{
-			bHasMinMip = true;
+			return true;
 		}
 	}
 
-	return bHasBias && bHasMinMip;
+	return false;
 }
 
 void ATextureMipBlendTestActor::StartRefineMinMipFade()
@@ -520,9 +460,8 @@ void ATextureMipBlendTestActor::ApplyTileTransform()
 		return;
 	}
 
-	// Engine plane is 100x100 uu (1m). Scale so the actor covers TileExtentCm on X and Y.
-	const float UniformScale = TileExtentCm / 100.0f;
-	TileMesh->SetRelativeScale3D(FVector(UniformScale, UniformScale, 1.0f));
+	// Engine plane is 100x100 uu (1m). TileMeshScale sets world size on each axis.
+	TileMesh->SetRelativeScale3D(TileMeshScale);
 }
 
 int32 ATextureMipBlendTestActor::CountMips(int32 SizeX)
@@ -826,7 +765,7 @@ void ATextureMipBlendTestActor::EnsureGeneratedTextures(bool bForceRebuild)
 
 	RefreshMipColorDebugInfo();
 
-	UpgradeRefineBias = GetUpgradeRefineBias();
+	UpgradeRefineMinMip = GetUpgradeRefineMinMip();
 
 	UE_LOG(LogTextureMipBlend, Display,
 		TEXT("Built honest texture pair [%s]: lo-res %d (%d mips) copies hi-res %d mips [1..%d]. Checker=%s (%d cells/edge, lo-res finest=%d texels/cell, hi-res mip0=%d texels/cell)."),
@@ -906,7 +845,7 @@ void ATextureMipBlendTestActor::LogMaterialScalarParameterNames() const
 	}
 }
 
-void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid, float RefineBias, float RefineMinMip)
+void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid, float RefineMinMip)
 {
 	if (!TileMesh || !Texture)
 	{
@@ -947,24 +886,20 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 		}
 	}
 
-	// Texture + refine scalars in one bind (atomic from the material's point of view).
+	// Texture + RefineMinMip in one bind (atomic from the material's point of view).
 	const FMaterialParameterInfo TextureParamInfo(TextureMipBlend::TextureParamName);
-	const FMaterialParameterInfo BiasParamInfo(TextureMipBlend::RefineBiasParamName);
 	const FMaterialParameterInfo MinMipParamInfo(TextureMipBlend::RefineMinMipParamName);
 
 	TileMid->SetTextureParameterValueByInfo(TextureParamInfo, Texture);
 
-	const bool bSupportsRefineScalars = MaterialSupportsRefineScalars();
-	if (bSupportsRefineScalars)
+	const bool bSupportsRefineMinMip = MaterialSupportsRefineMinMip();
+	if (bSupportsRefineMinMip)
 	{
-		TileMid->SetScalarParameterValueByInfo(BiasParamInfo, RefineBias);
 		TileMid->SetScalarParameterValueByInfo(MinMipParamInfo, RefineMinMip);
-		CurrentRefineBias = RefineBias;
 		CurrentRefineMinMip = RefineMinMip;
 	}
 	else
 	{
-		CurrentRefineBias = 0.0f;
 		CurrentRefineMinMip = 0.0f;
 	}
 
@@ -985,21 +920,20 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 	}
 	else
 	{
-		if (bSupportsRefineScalars)
+		if (bSupportsRefineMinMip)
 		{
 			UE_LOG(LogTextureMipBlend, Display,
-				TEXT("%s [%s]: bound '%s' on MID '%s' (RefineMinMip=%.2f, RefineBias=%.2f)."),
+				TEXT("%s [%s]: bound '%s' on MID '%s' (RefineMinMip=%.2f)."),
 				*GetName(),
 				*SamplingLabel,
 				*Texture->GetName(),
 				*TileMid->GetName(),
-				RefineMinMip,
-				RefineBias);
+				RefineMinMip);
 		}
 		else
 		{
 			UE_LOG(LogTextureMipBlend, Display,
-				TEXT("%s [%s]: bound '%s' on MID '%s' (default sampler material — no Refine scalars)."),
+				TEXT("%s [%s]: bound '%s' on MID '%s' (default sampler — no RefineMinMip)."),
 				*GetName(),
 				*SamplingLabel,
 				*Texture->GetName(),
@@ -1009,12 +943,6 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 
 	bBoundToHiRes = bIsHiResBinding;
 
-	if (!bSupportsRefineScalars)
-	{
-		CurrentRefineBias = 0.0f;
-		CurrentRefineMinMip = 0.0f;
-	}
-
 	const TCHAR* ResLabel = bIsHiResBinding ? TEXT("HiRes") : TEXT("LoRes");
 	BoundTextureDescription = FString::Printf(
 		TEXT("%s %dx%d (%d mips)%s"),
@@ -1022,8 +950,8 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 		Texture->GetSizeX(),
 		Texture->GetSizeY(),
 		Texture->GetNumMips(),
-		bSupportsRefineScalars
-			? *FString::Printf(TEXT(", RefineMinMip=%.2f, RefineBias=%.2f"), RefineMinMip, RefineBias)
+		bSupportsRefineMinMip
+			? *FString::Printf(TEXT(", RefineMinMip=%.2f"), RefineMinMip)
 			: TEXT(", default sampler"));
 
 	TileMid->RecacheUniformExpressions(false);
