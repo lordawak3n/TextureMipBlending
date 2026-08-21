@@ -13,6 +13,7 @@
 #include "RenderingThread.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
+#include "HAL/IConsoleManager.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogTextureMipBlend, Log, All);
 
@@ -22,6 +23,9 @@ namespace TextureMipBlend
 	static const FName RefineBiasParamName(TEXT("RefineBias"));
 	static const FName RefineMinMipParamName(TEXT("RefineMinMip"));
 	static constexpr int32 BytesPerPixel = 4;
+
+	static TArray<TWeakObjectPtr<ATextureMipBlendTestActor>> ActiveTestActors;
+	static TWeakObjectPtr<ATextureMipBlendTestActor> BindInputLeader;
 }
 
 ATextureMipBlendTestActor::ATextureMipBlendTestActor()
@@ -73,7 +77,17 @@ void ATextureMipBlendTestActor::BeginPlay()
 
 	// PIE duplicates can retain editor-world texture pointers or a MID that still samples the material default.
 	InitializeTileVisuals(/*bForceTextureRebuild=*/true);
-	SetupSwapInput();
+	RegisterWithBindGroup();
+	TryAcquireBindInputLeader();
+	if (IsBindInputLeader())
+	{
+		SetupSwapInput();
+	}
+
+	if (IConsoleVariable* MaxAnisoCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.MaxAnisotropy")))
+	{
+		MaxAnisoCVar->Set(FMath::Clamp(MaxTextureAnisotropy, 1, 16), ECVF_SetByCode);
+	}
 
 	const TCHAR* ModeLabel = TEXT("MinMipFrozenAtUpgrade");
 	if (SwapRefineMode == ETextureMipBlendSwapMode::Naive)
@@ -86,12 +100,16 @@ void ATextureMipBlendTestActor::BeginPlay()
 	}
 
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("%s Phase 4 ready: %dx%d lo-res bound. Mode=%s (UpgradeMinMip=%.2f). '%s'=lo-res, '%s'=hi-res (%.2fs delay)."),
+		TEXT("%s Phase 5a ready [%s]: %dx%d lo-res bound. Mode=%s (UpgradeMinMip=%.2f). CheckerFinest=%s (%d texels/cell, aniso=%d). '%s'=lo-res, '%s'=hi-res (%.2fs delay). Place a second actor with default-sampler material for side-by-side aniso compare."),
 		*GetName(),
+		*SamplingLabel,
 		LoResTexture ? LoResTexture->GetSizeX() : 0,
 		LoResTexture ? LoResTexture->GetSizeY() : 0,
 		ModeLabel,
 		UpgradeRefineBias,
+		bCheckerOnFinestMips ? TEXT("yes") : TEXT("no"),
+		CheckerTexelsPerCell,
+		MaxTextureAnisotropy,
 		*LoResKey.GetDisplayName().ToString(),
 		*HiResKey.GetDisplayName().ToString(),
 		SwapDelaySeconds);
@@ -138,7 +156,85 @@ void ATextureMipBlendTestActor::EndPlay(const EEndPlayReason::Type EndPlayReason
 	}
 
 	bSwapScheduled = false;
+
+	const bool bWasInputLeader = IsBindInputLeader();
+	UnregisterFromBindGroup();
+
+	if (bWasInputLeader)
+	{
+		TextureMipBlend::BindInputLeader.Reset();
+		for (const TWeakObjectPtr<ATextureMipBlendTestActor>& WeakActor : TextureMipBlend::ActiveTestActors)
+		{
+			if (ATextureMipBlendTestActor* Actor = WeakActor.Get())
+			{
+				TextureMipBlend::BindInputLeader = Actor;
+				Actor->SetupSwapInput();
+				break;
+			}
+		}
+	}
+
 	Super::EndPlay(EndPlayReason);
+}
+
+void ATextureMipBlendTestActor::RegisterWithBindGroup()
+{
+	TextureMipBlend::ActiveTestActors.AddUnique(this);
+}
+
+void ATextureMipBlendTestActor::UnregisterFromBindGroup()
+{
+	TextureMipBlend::ActiveTestActors.RemoveAll(
+		[this](const TWeakObjectPtr<ATextureMipBlendTestActor>& WeakActor)
+		{
+			return !WeakActor.IsValid() || WeakActor.Get() == this;
+		});
+}
+
+bool ATextureMipBlendTestActor::IsBindInputLeader() const
+{
+	return TextureMipBlend::BindInputLeader.Get() == this;
+}
+
+void ATextureMipBlendTestActor::TryAcquireBindInputLeader()
+{
+	if (!TextureMipBlend::BindInputLeader.IsValid())
+	{
+		TextureMipBlend::BindInputLeader = this;
+	}
+}
+
+void ATextureMipBlendTestActor::BroadcastBindRequest(bool bBindHiRes, const FKey& SourceKey)
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	int32 SyncedActorCount = 0;
+	for (const TWeakObjectPtr<ATextureMipBlendTestActor>& WeakActor : TextureMipBlend::ActiveTestActors)
+	{
+		ATextureMipBlendTestActor* Actor = WeakActor.Get();
+		if (!Actor || Actor->GetWorld() != World || !Actor->bSyncTextureBindsWithGroup)
+		{
+			continue;
+		}
+
+		++SyncedActorCount;
+		Actor->RequestTextureBind(bBindHiRes, SourceKey);
+	}
+
+	if (SyncedActorCount <= 1)
+	{
+		return;
+	}
+
+	UE_LOG(LogTextureMipBlend, Display,
+		TEXT("Bind group: '%s' -> %s on %d synced actors."),
+		*SourceKey.GetDisplayName().ToString(),
+		bBindHiRes ? TEXT("hi-res") : TEXT("lo-res"),
+		SyncedActorCount);
 }
 
 void ATextureMipBlendTestActor::SetupSwapInput()
@@ -161,12 +257,12 @@ void ATextureMipBlendTestActor::SetupSwapInput()
 
 void ATextureMipBlendTestActor::HandleLoResKeyPressed()
 {
-	RequestTextureBind(/*bBindHiRes=*/false, LoResKey);
+	BroadcastBindRequest(/*bBindHiRes=*/false, LoResKey);
 }
 
 void ATextureMipBlendTestActor::HandleHiResKeyPressed()
 {
-	RequestTextureBind(/*bBindHiRes=*/true, HiResKey);
+	BroadcastBindRequest(/*bBindHiRes=*/true, HiResKey);
 }
 
 void ATextureMipBlendTestActor::RequestTextureBind(bool bBindHiRes, const FKey& SourceKey)
@@ -277,9 +373,15 @@ void ATextureMipBlendTestActor::PostEditChangeProperty(FPropertyChangedEvent& Pr
 	const FName PropertyName = PropertyChangedEvent.GetPropertyName();
 	if (PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, LoResSize)
 		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, TileMaterial)
-		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, TileExtentCm))
+		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, TileExtentCm)
+		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, bCheckerOnFinestMips)
+		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, CheckerTexelsPerCell)
+		|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, MaxTextureAnisotropy))
 	{
-		if (PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, LoResSize))
+		if (PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, LoResSize)
+			|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, bCheckerOnFinestMips)
+			|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, CheckerTexelsPerCell)
+			|| PropertyName == GET_MEMBER_NAME_CHECKED(ATextureMipBlendTestActor, MaxTextureAnisotropy))
 		{
 			LoResTexture = nullptr;
 			HiResTexture = nullptr;
@@ -338,9 +440,21 @@ float ATextureMipBlendTestActor::GetUpgradeRefineBias() const
 	return FMath::Log2(static_cast<float>(HiResSize) / static_cast<float>(LoResSize));
 }
 
+int32 ATextureMipBlendTestActor::GetCheckerCellsPerEdge() const
+{
+	const int32 ClampedCellSize = FMath::Clamp(CheckerTexelsPerCell, 2, 256);
+	return FMath::Max(LoResSize / ClampedCellSize, 2);
+}
+
+int32 ATextureMipBlendTestActor::GetCheckerTexelsPerCellForMipSize(int32 MipSize) const
+{
+	const int32 CellsPerEdge = GetCheckerCellsPerEdge();
+	return FMath::Clamp(MipSize / CellsPerEdge, 2, MipSize);
+}
+
 void ATextureMipBlendTestActor::ApplyRefineScalarsToMid(float RefineBias, float RefineMinMip)
 {
-	if (!TileMid)
+	if (!TileMid || !MaterialSupportsRefineScalars())
 	{
 		return;
 	}
@@ -353,6 +467,34 @@ void ATextureMipBlendTestActor::ApplyRefineScalarsToMid(float RefineBias, float 
 
 	CurrentRefineBias = RefineBias;
 	CurrentRefineMinMip = RefineMinMip;
+}
+
+bool ATextureMipBlendTestActor::MaterialSupportsRefineScalars() const
+{
+	if (!TileMaterial)
+	{
+		return false;
+	}
+
+	TArray<FMaterialParameterInfo> ScalarInfos;
+	TArray<FGuid> ScalarIds;
+	TileMaterial->GetAllScalarParameterInfo(ScalarInfos, ScalarIds);
+
+	bool bHasBias = false;
+	bool bHasMinMip = false;
+	for (const FMaterialParameterInfo& Info : ScalarInfos)
+	{
+		if (Info.Name == TextureMipBlend::RefineBiasParamName)
+		{
+			bHasBias = true;
+		}
+		else if (Info.Name == TextureMipBlend::RefineMinMipParamName)
+		{
+			bHasMinMip = true;
+		}
+	}
+
+	return bHasBias && bHasMinMip;
 }
 
 void ATextureMipBlendTestActor::StartRefineMinMipFade()
@@ -431,6 +573,26 @@ FName ATextureMipBlendTestActor::GetMipDebugColorName(int32 MipIndexFromFinest)
 	return MipColorNames[FMath::Clamp(MipIndexFromFinest, 0, NumNames - 1)];
 }
 
+FString ATextureMipBlendTestActor::GetMipDebugDisplayName(int32 MipIndexFromFinest, bool bChecker)
+{
+	const FName ColorName = GetMipDebugColorName(MipIndexFromFinest);
+	if (bChecker)
+	{
+		return FString::Printf(TEXT("%s Checker"), *ColorName.ToString());
+	}
+	return ColorName.ToString();
+}
+
+FColor ATextureMipBlendTestActor::GetMipCheckerAlternateColor(FColor BaseColor)
+{
+	// Dark alternate square — high contrast for grazing-angle / aniso streaks.
+	return FColor(
+		static_cast<uint8>(BaseColor.R >> 2),
+		static_cast<uint8>(BaseColor.G >> 2),
+		static_cast<uint8>(BaseColor.B >> 2),
+		255);
+}
+
 void ATextureMipBlendTestActor::RefreshMipColorDebugInfo()
 {
 	HiResMipColorLegend.Reset();
@@ -448,7 +610,7 @@ void ATextureMipBlendTestActor::RefreshMipColorDebugInfo()
 		FMipDebugColorEntry Entry;
 		Entry.MipIndex = MipIndex;
 		Entry.MipSizeTexels = HiResTexture->GetSizeX() >> MipIndex;
-		Entry.ColorName = GetMipDebugColorName(MipIndex).ToString();
+		Entry.ColorName = GetMipDebugDisplayName(MipIndex, bCheckerOnFinestMips);
 		Entry.Color = GetMipDebugColor(MipIndex);
 		HiResMipColorLegend.Add(Entry);
 	}
@@ -463,7 +625,7 @@ void ATextureMipBlendTestActor::RefreshMipColorDebugInfo()
 			Entry.MipSizeTexels = LoResTexture->GetSizeX() >> MipIndex;
 			// Lo-res mip N is a byte copy of hi-res mip N+1 (honest server).
 			const int32 SourceHiResMip = MipIndex + 1;
-			Entry.ColorName = GetMipDebugColorName(SourceHiResMip).ToString();
+			Entry.ColorName = GetMipDebugDisplayName(SourceHiResMip, bCheckerOnFinestMips);
 			Entry.Color = GetMipDebugColor(SourceHiResMip);
 			LoResMipColorLegend.Add(Entry);
 		}
@@ -539,6 +701,43 @@ void ATextureMipBlendTestActor::FillMipSolidColor(UTexture2D* Texture, int32 Mip
 	Mip.BulkData.Unlock();
 }
 
+void ATextureMipBlendTestActor::FillMipCheckerPattern(UTexture2D* Texture, int32 MipIndex, FColor BaseColor, int32 TexelsPerCell)
+{
+	if (!Texture || !Texture->GetPlatformData())
+	{
+		return;
+	}
+
+	TIndirectArray<FTexture2DMipMap>& Mips = Texture->GetPlatformData()->Mips;
+	if (!Mips.IsValidIndex(MipIndex))
+	{
+		return;
+	}
+
+	const int32 ClampedCellSize = FMath::Clamp(TexelsPerCell, 2, 256);
+	const FColor AlternateColor = GetMipCheckerAlternateColor(BaseColor);
+
+	FTexture2DMipMap& Mip = Mips[MipIndex];
+	const int32 Width = static_cast<int32>(Mip.SizeX);
+	const int32 Height = static_cast<int32>(Mip.SizeY);
+	const int32 TexelCount = Width * Height;
+	const int64 Bytes = static_cast<int64>(TexelCount) * TextureMipBlend::BytesPerPixel;
+
+	Mip.BulkData.Lock(LOCK_READ_WRITE);
+	FColor* Pixels = reinterpret_cast<FColor*>(Mip.BulkData.Realloc(Bytes));
+	for (int32 Y = 0; Y < Height; ++Y)
+	{
+		const int32 CellY = Y / ClampedCellSize;
+		for (int32 X = 0; X < Width; ++X)
+		{
+			const int32 CellX = X / ClampedCellSize;
+			const bool bAlternate = ((CellX + CellY) & 1) != 0;
+			Pixels[Y * Width + X] = bAlternate ? AlternateColor : BaseColor;
+		}
+	}
+	Mip.BulkData.Unlock();
+}
+
 void ATextureMipBlendTestActor::CopyMip(UTexture2D* Dest, int32 DestMipIndex, UTexture2D* Source, int32 SourceMipIndex)
 {
 	if (!Dest || !Source || !Dest->GetPlatformData() || !Source->GetPlatformData())
@@ -600,9 +799,19 @@ void ATextureMipBlendTestActor::EnsureGeneratedTextures(bool bForceRebuild)
 	LoResTexture = CreateSolidMipTexture(LoResSize, TEXT("LoResTileTexture"));
 
 	const int32 HiResMipCount = CountMips(HiResSize);
+	const int32 CellsPerEdge = GetCheckerCellsPerEdge();
 	for (int32 MipIndex = 0; MipIndex < HiResMipCount; ++MipIndex)
 	{
-		FillMipSolidColor(HiResTexture, MipIndex, GetMipDebugColor(MipIndex));
+		const FColor MipColor = GetMipDebugColor(MipIndex);
+		const int32 MipSize = HiResSize >> MipIndex;
+		if (bCheckerOnFinestMips)
+		{
+			FillMipCheckerPattern(HiResTexture, MipIndex, MipColor, GetCheckerTexelsPerCellForMipSize(MipSize));
+		}
+		else
+		{
+			FillMipSolidColor(HiResTexture, MipIndex, MipColor);
+		}
 	}
 
 	const int32 LoResMipCount = CountMips(LoResSize);
@@ -620,13 +829,16 @@ void ATextureMipBlendTestActor::EnsureGeneratedTextures(bool bForceRebuild)
 	UpgradeRefineBias = GetUpgradeRefineBias();
 
 	UE_LOG(LogTextureMipBlend, Display,
-		TEXT("Built honest texture pair: lo-res %d (%d mips, finest=%s) is an exact copy of hi-res %d mips [1..%d] (hi-res finest=%s)."),
+		TEXT("Built honest texture pair [%s]: lo-res %d (%d mips) copies hi-res %d mips [1..%d]. Checker=%s (%d cells/edge, lo-res finest=%d texels/cell, hi-res mip0=%d texels/cell)."),
+		*SamplingLabel,
 		LoResSize,
 		LoResMipCount,
-		*GetMipDebugColor(1).ToString(),
 		HiResSize,
 		HiResMipCount - 1,
-		*GetMipDebugColor(0).ToString());
+		bCheckerOnFinestMips ? TEXT("all mips") : TEXT("off"),
+		CellsPerEdge,
+		GetCheckerTexelsPerCellForMipSize(LoResSize),
+		GetCheckerTexelsPerCellForMipSize(HiResSize));
 }
 
 void ATextureMipBlendTestActor::EnsureTextureResourceReady(UTexture2D* Texture)
@@ -741,8 +953,20 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 	const FMaterialParameterInfo MinMipParamInfo(TextureMipBlend::RefineMinMipParamName);
 
 	TileMid->SetTextureParameterValueByInfo(TextureParamInfo, Texture);
-	TileMid->SetScalarParameterValueByInfo(BiasParamInfo, RefineBias);
-	TileMid->SetScalarParameterValueByInfo(MinMipParamInfo, RefineMinMip);
+
+	const bool bSupportsRefineScalars = MaterialSupportsRefineScalars();
+	if (bSupportsRefineScalars)
+	{
+		TileMid->SetScalarParameterValueByInfo(BiasParamInfo, RefineBias);
+		TileMid->SetScalarParameterValueByInfo(MinMipParamInfo, RefineMinMip);
+		CurrentRefineBias = RefineBias;
+		CurrentRefineMinMip = RefineMinMip;
+	}
+	else
+	{
+		CurrentRefineBias = 0.0f;
+		CurrentRefineMinMip = 0.0f;
+	}
 
 	// Apply MID to mesh after parameters are set (order matters for some render paths).
 	TileMesh->SetMaterial(0, TileMid);
@@ -761,28 +985,46 @@ void ATextureMipBlendTestActor::BindTextureToMaterial(UTexture2D* Texture, bool 
 	}
 	else
 	{
-		UE_LOG(LogTextureMipBlend, Display,
-			TEXT("%s: bound '%s' on MID '%s' (RefineMinMip=%.2f, RefineBias=%.2f)."),
-			*GetName(),
-			*Texture->GetName(),
-			*TileMid->GetName(),
-			RefineMinMip,
-			RefineBias);
+		if (bSupportsRefineScalars)
+		{
+			UE_LOG(LogTextureMipBlend, Display,
+				TEXT("%s [%s]: bound '%s' on MID '%s' (RefineMinMip=%.2f, RefineBias=%.2f)."),
+				*GetName(),
+				*SamplingLabel,
+				*Texture->GetName(),
+				*TileMid->GetName(),
+				RefineMinMip,
+				RefineBias);
+		}
+		else
+		{
+			UE_LOG(LogTextureMipBlend, Display,
+				TEXT("%s [%s]: bound '%s' on MID '%s' (default sampler material — no Refine scalars)."),
+				*GetName(),
+				*SamplingLabel,
+				*Texture->GetName(),
+				*TileMid->GetName());
+		}
 	}
 
 	bBoundToHiRes = bIsHiResBinding;
-	CurrentRefineBias = RefineBias;
-	CurrentRefineMinMip = RefineMinMip;
+
+	if (!bSupportsRefineScalars)
+	{
+		CurrentRefineBias = 0.0f;
+		CurrentRefineMinMip = 0.0f;
+	}
 
 	const TCHAR* ResLabel = bIsHiResBinding ? TEXT("HiRes") : TEXT("LoRes");
 	BoundTextureDescription = FString::Printf(
-		TEXT("%s %dx%d (%d mips), RefineMinMip=%.2f, RefineBias=%.2f"),
+		TEXT("%s %dx%d (%d mips)%s"),
 		ResLabel,
 		Texture->GetSizeX(),
 		Texture->GetSizeY(),
 		Texture->GetNumMips(),
-		RefineMinMip,
-		RefineBias);
+		bSupportsRefineScalars
+			? *FString::Printf(TEXT(", RefineMinMip=%.2f, RefineBias=%.2f"), RefineMinMip, RefineBias)
+			: TEXT(", default sampler"));
 
 	TileMid->RecacheUniformExpressions(false);
 	TileMesh->MarkRenderDynamicDataDirty();

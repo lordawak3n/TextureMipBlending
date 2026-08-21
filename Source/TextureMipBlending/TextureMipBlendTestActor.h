@@ -52,6 +52,7 @@ enum class ETextureMipBlendSwapMode : uint8
  * Phase 1: honest lo-res / hi-res pair, lo-res bound at start.
  * Phase 2: dedicated keys bind lo/hi textures; SwapRefineMode = Naive (RefineBias 0, pop).
  * Phase 4: SwapRefineMode = Fade animates RefineMinMip from log2(hi/lo) down to 0.
+ * Phase 5a: checker on finest mips; duplicate actor + default-sampler material for aniso compare.
  *
  * Material contract (M_TileMipBlend):
  *   Texture param   "TileTexture"
@@ -87,6 +88,26 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Textures", meta = (ClampMin = "16", ClampMax = "4096"))
 	int32 LoResSize = 512;
 
+	/**
+	 * Phase 5a: every mip uses a color-coded checker (same cell count per mip edge).
+	 * Hi-res mip 0 uses 2x texels/cell so its UV frequency matches mip 1 / lo-res finest.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Textures")
+	bool bCheckerOnFinestMips = true;
+
+	/** Checker cell size in texels at lo-res finest mip; coarser mips scale to keep cell count constant. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Textures",
+		meta = (ClampMin = "2", ClampMax = "256", EditCondition = "bCheckerOnFinestMips", EditConditionHides))
+	int32 CheckerTexelsPerCell = 32;
+
+	/** Requested max anisotropy — applied via r.MaxAnisotropy at BeginPlay (UE 5.6 has no per-texture override). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Textures", meta = (ClampMin = "1", ClampMax = "16"))
+	int32 MaxTextureAnisotropy = 8;
+
+	/** Short label for Output Log (e.g. "Custom SampleLevel" vs "Default Aniso"). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Debug")
+	FString SamplingLabel = TEXT("Custom");
+
 	/** Seconds to wait after a bind key before the texture actually changes. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input", meta = (ClampMin = "0.0"))
 	float SwapDelaySeconds = 0.5f;
@@ -98,6 +119,10 @@ public:
 	/** Bind hi-res texture (after SwapDelaySeconds). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input")
 	FKey HiResKey = EKeys::Two;
+
+	/** When true, lo/hi bind keys update every synced actor in the level (side-by-side compare planes). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Input")
+	bool bSyncTextureBindsWithGroup = true;
 
 	/** Controls RefineBias behavior when swapping lo-res <-> hi-res. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Texture Mip Blend|Refine")
@@ -175,15 +200,23 @@ private:
 	void EnsureGeneratedTextures(bool bForceRebuild);
 	void BindTextureToMaterial(UTexture2D* Texture, bool bIsHiResBinding, bool bForceRecreateMid, float RefineBias, float RefineMinMip);
 	void ApplyRefineScalarsToMid(float RefineBias, float RefineMinMip);
+	bool MaterialSupportsRefineScalars() const;
 	void StartRefineMinMipFade();
 	void StopRefineMinMipFade();
 	float GetUpgradeRefineBias() const;
+	int32 GetCheckerCellsPerEdge() const;
+	int32 GetCheckerTexelsPerCellForMipSize(int32 MipSize) const;
 	void ComputeRefineScalarsForBind(bool bIsHiResBinding, float& OutRefineBias, float& OutRefineMinMip) const;
 	void LogMaterialScalarParameterNames() const;
 	void EnsureTextureResourceReady(UTexture2D* Texture);
 	void LogMaterialTextureParameterNames() const;
 	void RefreshMipColorDebugInfo();
 	void SetupSwapInput();
+	void RegisterWithBindGroup();
+	void UnregisterFromBindGroup();
+	bool IsBindInputLeader() const;
+	void TryAcquireBindInputLeader();
+	void BroadcastBindRequest(bool bBindHiRes, const FKey& SourceKey);
 	void RequestTextureBind(bool bBindHiRes, const FKey& SourceKey);
 	void HandleLoResKeyPressed();
 	void HandleHiResKeyPressed();
@@ -196,8 +229,11 @@ private:
 
 	UTexture2D* CreateSolidMipTexture(int32 SizeX, FName DebugName);
 	void FillMipSolidColor(UTexture2D* Texture, int32 MipIndex, FColor Color);
+	void FillMipCheckerPattern(UTexture2D* Texture, int32 MipIndex, FColor BaseColor, int32 TexelsPerCell);
 	void CopyMip(UTexture2D* Dest, int32 DestMipIndex, UTexture2D* Source, int32 SourceMipIndex);
 	static FColor GetMipDebugColor(int32 MipIndexFromFinest);
+	static FColor GetMipCheckerAlternateColor(FColor BaseColor);
 	static FName GetMipDebugColorName(int32 MipIndexFromFinest);
+	static FString GetMipDebugDisplayName(int32 MipIndexFromFinest, bool bChecker);
 	static int32 CountMips(int32 SizeX);
 };
